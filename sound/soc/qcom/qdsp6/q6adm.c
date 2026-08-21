@@ -170,6 +170,8 @@ static int q6adm_device_close(struct q6adm *adm, struct q6copp *copp,
 
 static void q6adm_free_copp(struct kref *ref)
 {
+	pr_info("LPASSDBG: adm_copp_free\n");
+
 	struct q6copp *c = container_of(ref, struct q6copp, refcount);
 	struct q6adm *adm = c->adm;
 	unsigned long flags;
@@ -387,6 +389,8 @@ struct q6copp *q6adm_open(struct device *dev, int port_id, int path, int rate,
 	unsigned long flags;
 	int ret = 0;
 
+	dev_info(dev, "LPASSDBG: adm_open port 0x%x path %d\n", port_id, path);
+
 	if (port_id < 0) {
 		dev_err(dev, "Invalid port_id %d\n", port_id);
 		return ERR_PTR(-EINVAL);
@@ -559,6 +563,8 @@ EXPORT_SYMBOL_GPL(q6adm_matrix_map);
  */
 int q6adm_close(struct device *dev, struct q6copp *copp)
 {
+	dev_info(dev, "LPASSDBG: adm_close\n");
+
 	kref_put(&copp->refcount, q6adm_free_copp);
 
 	return 0;

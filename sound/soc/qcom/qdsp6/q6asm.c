@@ -925,6 +925,8 @@ int q6asm_open_write(struct audio_client *ac, uint32_t stream_id,
 		     uint32_t format, u32 codec_profile,
 		     uint16_t bits_per_sample, bool is_gapless)
 {
+	pr_info("LPASSDBG: asm_open_write session %d\n", ac->session);
+
 	struct asm_stream_cmd_open_write_v3 *open;
 	struct apr_pkt *pkt;
 	int rc, pkt_size = APR_HDR_SIZE + sizeof(*open);
@@ -1626,6 +1628,8 @@ static int __q6asm_cmd(struct audio_client *ac, uint32_t stream_id, int cmd,
  */
 int q6asm_cmd(struct audio_client *ac, uint32_t stream_id, int cmd)
 {
+	pr_info("LPASSDBG: asm_cmd session %d cmd %d\n", ac->session, cmd);
+
 	return __q6asm_cmd(ac, stream_id, cmd, true);
 }
 EXPORT_SYMBOL_GPL(q6asm_cmd);

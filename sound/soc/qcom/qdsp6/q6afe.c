@@ -1224,6 +1224,9 @@ int q6afe_set_lpass_clock(struct device *dev, int clk_id, int attri,
 			  int clk_root, unsigned int freq)
 {
 	struct q6afe *afe = dev_get_drvdata(dev->parent);
+
+	dev_info(dev, "LPASSDBG: set_lpass_clock id 0x%x attri %d root %d freq %u\n",
+		 clk_id, attri, clk_root, freq);
 	struct afe_clk_set cset = {0,};
 
 	cset.clk_set_minor_version = AFE_API_VERSION_CLOCK_SET;
@@ -1308,6 +1311,8 @@ int q6afe_port_stop(struct q6afe_port *port)
 	int port_id = port->id;
 	int ret = 0;
 	int index, pkt_size;
+
+	dev_info(afe->dev, "LPASSDBG: port_stop id 0x%x\n", port_id);
 
 	index = port->token;
 	if (index < 0 || index >= AFE_PORT_MAX) {
@@ -1697,6 +1702,8 @@ int q6afe_port_start(struct q6afe_port *port)
 	int ret, param_id = port->cfg_type;
 	struct apr_pkt *pkt;
 	int pkt_size;
+
+	dev_info(afe->dev, "LPASSDBG: port_start id 0x%x\n", port_id);
 
 	ret  = q6afe_port_set_param_v2(port, &port->port_cfg, param_id,
 				       AFE_MODULE_AUDIO_DEV_INTERFACE,

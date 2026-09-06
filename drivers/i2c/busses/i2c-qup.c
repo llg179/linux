@@ -1071,6 +1071,9 @@ static int qup_i2c_wait_for_complete(struct qup_i2c_dev *qup,
 					   qup_i2c_xfer_timeout(qup, msg->len));
 	if (!left) {
 		u32 status = readl(qup->base + QUP_I2C_STATUS);
+		u32 state = readl(qup->base + QUP_STATE);
+		u32 opflags = readl(qup->base + QUP_OPERATIONAL);
+		u32 qup_err = readl(qup->base + QUP_ERROR_FLAGS);
 
 		/*
 		 * A timeout says only that nothing completed. Whether the bus
@@ -1079,16 +1082,26 @@ static int qup_i2c_wait_for_complete(struct qup_i2c_dev *qup,
 		 * so print it instead of making the next reader guess. It is
 		 * rate limited because a slave that wedges asserts its
 		 * interrupt continuously.
+		 *
+		 * SDA high with SCL low fits two states that need opposite
+		 * fixes: a slave stretching the clock while the master waits
+		 * correctly, or the master's own state machine wedged with SCL
+		 * driven low. The core registers separate them - a RUN state
+		 * with no error flags and no output-service request is a
+		 * master that is waiting, while a stale state or a set error
+		 * flag is a master that has stopped - so read all three at the
+		 * same instant as the status.
 		 */
 		dev_err_ratelimited(qup->dev,
-				    "transfer to 0x%02x timed out, bus %s, %s, SDA %d SCL %d (I2C_STATUS 0x%08x)\n",
+				    "transfer to 0x%02x timed out, bus %s, %s, SDA %d SCL %d (I2C_STATUS 0x%08x STATE 0x%08x OPER 0x%08x ERR 0x%08x)\n",
 				    msg->addr,
 				    status & I2C_STATUS_BUS_ACTIVE ?
 					    "active" : "idle",
 				    status & I2C_STATUS_BUS_MASTER ?
 					    "master is us" : "master is not us",
 				    !!(status & I2C_STATUS_SDA),
-				    !!(status & I2C_STATUS_SCL), status);
+				    !!(status & I2C_STATUS_SCL), status,
+				    state, opflags, qup_err);
 
 		/*
 		 * Only when somebody is actually holding the bus. A timeout on

@@ -22,6 +22,7 @@
 #include <linux/interrupt.h>
 #include <linux/kernel.h>
 #include <linux/regmap.h>
+#include <linux/string.h>
 #include <linux/regulator/consumer.h>
 
 #define HIMAX_MAX_POINTS		10
@@ -335,8 +336,36 @@ static int himax_handle_input(struct himax_ts_data *ts)
 	 * Only process the current event when it has a valid checksum but
 	 * don't consider it a fatal error when it doesn't.
 	 */
-	if (himax_verify_checksum(ts, &event))
-		himax_process_event(ts, &event);
+	if (!himax_verify_checksum(ts, &event))
+		return 0;
+
+	/*
+	 * An all-zero event is not something this controller reports. Its idle
+	 * frame is 0xff - himax_event_get_num_points() special-cases
+	 * num_points == 0xff, and an empty slot is HIMAX_INVALID_COORD, which
+	 * is 0xffff. Yet a buffer of zeroes passes himax_verify_checksum(),
+	 * because that sums the bytes and requires the low byte of the sum to
+	 * be zero, which an empty buffer satisfies trivially. It then yields
+	 * zero points, so himax_process_event() reports nothing, and the input
+	 * core suppresses the redundant SYN_REPORT - leaving no frame, no
+	 * error and no trace of any kind.
+	 *
+	 * That is the shape of the fault under investigation on the Fairphone
+	 * 3: taps vanish with the panel otherwise healthy, and the only
+	 * evidence is an interrupt that produced no frame. Say so out loud,
+	 * rate limited, with the bytes, so the next occurrence answers whether
+	 * a read really is coming back as zeroes. This only reports; the
+	 * event is still processed exactly as before, so the measurement is
+	 * not confounded by a change in behaviour.
+	 */
+	if (!memchr_inv(&event, 0, sizeof(event)))
+		dev_warn_ratelimited(&ts->client->dev,
+				     "all-zero event accepted by the checksum\n");
+	else if (!himax_event_get_num_points(&event))
+		dev_dbg(&ts->client->dev, "empty event: %*ph\n",
+			(int)sizeof(event), &event);
+
+	himax_process_event(ts, &event);
 
 	return 0;
 }

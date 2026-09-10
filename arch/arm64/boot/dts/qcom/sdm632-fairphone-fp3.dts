@@ -302,6 +302,7 @@
 		touchscreen-size-x = <1080>;
 		touchscreen-size-y = <2160>;
 		reset-gpios = <&tlmm 64 GPIO_ACTIVE_LOW>;
+		panel = <&panel>;
 
 		iovcc-supply = <&pm8953_l6>;
 		vdda-supply = <&pm8953_l10>;
@@ -357,7 +358,7 @@
 	vdda-supply = <&pm8953_s3>;
 	status = "okay";
 
-	panel@0 {
+	panel: panel@0 {
 		compatible = "djn,98-03057-6598b-i";
 		reg = <0>;
 

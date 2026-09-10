@@ -12,6 +12,7 @@
  * Copyright (C) 2017 Himax Corporation.
  */
 
+#include <linux/bits.h>
 #include <linux/delay.h>
 #include <linux/err.h>
 #include <linux/gpio/consumer.h>
@@ -20,6 +21,7 @@
 #include <linux/input/mt.h>
 #include <linux/input/touchscreen.h>
 #include <linux/interrupt.h>
+#include <linux/jiffies.h>
 #include <linux/kernel.h>
 #include <linux/regmap.h>
 #include <linux/string.h>
@@ -53,6 +55,27 @@
  */
 #define HIMAX_POWER_ON_DELAY_MS		20
 
+/*
+ * Firmware configuration words, reached through the AHB window like any other
+ * register. The idle-mode word and its switch bit are those the vendor driver
+ * in Fairphone's published FP3 kernel toggles in himax_idle_mode()
+ * (drivers/input/touchscreen/hxchipset83112b/himax_ic.c): it writes 0x1f to
+ * the low byte to enable idle mode and 0x17 to disable it, so bit 3 is the
+ * switch and the other bits are left as the firmware set them.
+ */
+#define HIMAX_REG_FW_IDLE_MODE		0x10007088
+#define HIMAX_FW_IDLE_MODE_ENABLE	BIT(3)
+
+/*
+ * After a reset the firmware reloads its configuration from flash and
+ * overwrites the idle-mode word with the stored default. Measured on a
+ * Fairphone 3: a value written a millisecond after the reset was still there
+ * 10 ms after probe returned and gone by 50 ms. The vendor driver waits 20 ms
+ * after releasing the reset line before it touches the part; 100 ms leaves
+ * twice the measured margin.
+ */
+#define HIMAX_FW_RELOAD_MS		100
+
 struct himax_event_point {
 	__be16 x;
 	__be16 y;
@@ -85,6 +108,8 @@ struct himax_ts_data {
 	struct regmap *regmap;
 	struct touchscreen_properties props;
 	unsigned int read_errors;
+	bool fw_config_dirty;
+	unsigned long reset_jiffies;
 };
 
 /*
@@ -149,6 +174,128 @@ static int himax_bus_read(struct himax_ts_data *ts, u32 address, void *dst,
 	return 0;
 }
 
+/*
+ * The AHB command registers are one byte wide and adjacent. The regmap is
+ * 32-bit, so a regmap_write() to one of them also writes three bytes of zero
+ * into its neighbours. Ahead of an event-stack read that is harmless; measured
+ * on a Fairphone 3, a firmware-word read issued after it comes back as its
+ * first byte repeated. The firmware words are therefore reached with the
+ * command registers written one byte at a time, which is also the form the
+ * vendor driver uses.
+ */
+static int himax_ahb_command(struct himax_ts_data *ts, u8 reg, u8 cmd)
+{
+	return i2c_smbus_write_byte_data(ts->client, reg, cmd);
+}
+
+static int himax_fw_window(struct himax_ts_data *ts)
+{
+	int error;
+
+	error = himax_ahb_command(ts, HIMAX_AHB_ADDR_CONTI, HIMAX_AHB_CMD_CONTI);
+	if (error)
+		return error;
+
+	return himax_ahb_command(ts, HIMAX_AHB_ADDR_INCR4, HIMAX_AHB_CMD_INCR4);
+}
+
+static int himax_read_fw_word(struct himax_ts_data *ts, u32 address, u32 *val)
+{
+	int error;
+
+	error = himax_fw_window(ts);
+	if (error)
+		return error;
+
+	error = regmap_write(ts->regmap, HIMAX_AHB_ADDR_BYTE_0, address);
+	if (error)
+		return error;
+
+	error = himax_ahb_command(ts, HIMAX_AHB_ADDR_ACCESS_DIRECTION,
+				  HIMAX_AHB_CMD_ACCESS_DIRECTION_READ);
+	if (error)
+		return error;
+
+	return regmap_read(ts->regmap, HIMAX_AHB_ADDR_RDATA_BYTE_0, val);
+}
+
+/*
+ * A write through the AHB window is a single transfer to the address register:
+ * the target address followed by the data, both little-endian.
+ */
+static int himax_write_fw_word(struct himax_ts_data *ts, u32 address, u32 val)
+{
+	u32 words[2] = { address, val };
+	int error;
+
+	error = himax_fw_window(ts);
+	if (error)
+		return error;
+
+	return regmap_bulk_write(ts->regmap, HIMAX_AHB_ADDR_BYTE_0, words,
+				 ARRAY_SIZE(words));
+}
+
+static int himax_set_fw_idle_mode(struct himax_ts_data *ts, bool enable)
+{
+	u32 val, want;
+	int error;
+
+	error = himax_read_fw_word(ts, HIMAX_REG_FW_IDLE_MODE, &val);
+	if (error)
+		return error;
+
+	want = enable ? val | HIMAX_FW_IDLE_MODE_ENABLE :
+			val & ~HIMAX_FW_IDLE_MODE_ENABLE;
+	if (want == val)
+		return 0;
+
+	error = himax_write_fw_word(ts, HIMAX_REG_FW_IDLE_MODE, want);
+	if (error)
+		return error;
+
+	/* A refused write is silent; only the read-back proves it took. */
+	error = himax_read_fw_word(ts, HIMAX_REG_FW_IDLE_MODE, &val);
+	if (error)
+		return error;
+
+	return (val ^ want) & HIMAX_FW_IDLE_MODE_ENABLE ? -EIO : 0;
+}
+
+/*
+ * The vendor driver re-sends its settings after every reset, so this runs after
+ * the reset in probe and after the one the interrupt handler issues on a wedged
+ * controller. It talks to the part and therefore only runs where the part is
+ * known to be awake: right after a reset, or on the interrupt thread.
+ *
+ * With idle mode enabled the firmware lowers its scan rate after a short period
+ * without a touch. On a Fairphone 3 taps go missing after such a pause, with
+ * no interrupt raised for them at all; keeping the part out of idle mode is
+ * the one state the vendor driver changes that the firmware defaults the other
+ * way.
+ */
+static void himax_apply_fw_config(struct himax_ts_data *ts)
+{
+	bool dirty = false;
+	int error;
+
+	/* Written now, it would be overwritten by the firmware's reload. */
+	if (time_before(jiffies, ts->reset_jiffies +
+				 msecs_to_jiffies(HIMAX_FW_RELOAD_MS))) {
+		WRITE_ONCE(ts->fw_config_dirty, true);
+		return;
+	}
+
+	error = himax_set_fw_idle_mode(ts, false);
+	if (error) {
+		dev_warn_ratelimited(&ts->client->dev,
+				     "Failed to disable idle mode: %d\n", error);
+		dirty = true;
+	}
+
+	WRITE_ONCE(ts->fw_config_dirty, dirty);
+}
+
 static void himax_reset(struct himax_ts_data *ts)
 {
 	gpiod_set_value_cansleep(ts->gpiod_rst, 1);
@@ -162,6 +309,7 @@ static void himax_reset(struct himax_ts_data *ts)
 	 * to include it. The range is just a guess that seems to work well.
 	 */
 	usleep_range(1000, 1100);
+	ts->reset_jiffies = jiffies;
 }
 
 static int himax_read_product_id(struct himax_ts_data *ts, u32 *product_id)
@@ -395,6 +543,8 @@ static irqreturn_t himax_irq_handler(int irq, void *dev_id)
 	error = himax_handle_input(ts);
 	if (!error) {
 		ts->read_errors = 0;
+		if (READ_ONCE(ts->fw_config_dirty))
+			himax_apply_fw_config(ts);
 		return IRQ_HANDLED;
 	}
 
@@ -416,6 +566,8 @@ static irqreturn_t himax_irq_handler(int irq, void *dev_id)
 			 "%u consecutive failed reads, resetting the controller\n",
 			 ts->read_errors);
 		himax_reset(ts);
+		/* Reapplied on the next pass that reaches the part. */
+		WRITE_ONCE(ts->fw_config_dirty, true);
 	}
 
 	/*
@@ -498,6 +650,15 @@ static int himax_probe(struct i2c_client *client)
 		if (error)
 			return error;
 	}
+
+	/*
+	 * Let the firmware finish its reload, apply the configuration, and
+	 * have the first interrupt read it back once more: a write that lands
+	 * inside the reload window is silently undone.
+	 */
+	msleep(HIMAX_FW_RELOAD_MS);
+	himax_apply_fw_config(ts);
+	WRITE_ONCE(ts->fw_config_dirty, true);
 
 	error = himax_input_register(ts);
 	if (error)

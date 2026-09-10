@@ -23,6 +23,8 @@
 #include <linux/interrupt.h>
 #include <linux/jiffies.h>
 #include <linux/kernel.h>
+#include <linux/notifier.h>
+#include <linux/power_supply.h>
 #include <linux/regmap.h>
 #include <linux/string.h>
 #include <linux/regulator/consumer.h>
@@ -76,6 +78,16 @@
  */
 #define HIMAX_FW_RELOAD_MS		100
 
+/*
+ * The charger-mode word is what the same vendor driver writes in
+ * himax_usb_detect_set() whenever the battery reports a charger: one magic
+ * value with a charger present, another without. The firmware defaults to
+ * neither.
+ */
+#define HIMAX_REG_FW_CHARGER_MODE	0x10007f38
+#define HIMAX_FW_CHARGER_MODE_ON	0xa55aa55a
+#define HIMAX_FW_CHARGER_MODE_OFF	0x77887788
+
 struct himax_event_point {
 	__be16 x;
 	__be16 y;
@@ -110,6 +122,7 @@ struct himax_ts_data {
 	unsigned int read_errors;
 	bool fw_config_dirty;
 	unsigned long reset_jiffies;
+	struct notifier_block psy_nb;
 };
 
 /*
@@ -262,6 +275,30 @@ static int himax_set_fw_idle_mode(struct himax_ts_data *ts, bool enable)
 	return (val ^ want) & HIMAX_FW_IDLE_MODE_ENABLE ? -EIO : 0;
 }
 
+static int himax_set_fw_charger_mode(struct himax_ts_data *ts, bool present)
+{
+	u32 want = present ? HIMAX_FW_CHARGER_MODE_ON : HIMAX_FW_CHARGER_MODE_OFF;
+	u32 val;
+	int error;
+
+	error = himax_read_fw_word(ts, HIMAX_REG_FW_CHARGER_MODE, &val);
+	if (error)
+		return error;
+
+	if (val == want)
+		return 0;
+
+	error = himax_write_fw_word(ts, HIMAX_REG_FW_CHARGER_MODE, want);
+	if (error)
+		return error;
+
+	error = himax_read_fw_word(ts, HIMAX_REG_FW_CHARGER_MODE, &val);
+	if (error)
+		return error;
+
+	return val == want ? 0 : -EIO;
+}
+
 /*
  * The vendor driver re-sends its settings after every reset, so this runs after
  * the reset in probe and after the one the interrupt handler issues on a wedged
@@ -293,7 +330,45 @@ static void himax_apply_fw_config(struct himax_ts_data *ts)
 		dirty = true;
 	}
 
+	/*
+	 * Without a power-supply class there is nothing to ask, and the part is
+	 * left as the vendor stack leaves it with the cable out.
+	 */
+	error = power_supply_is_system_supplied();
+	if (error >= 0) {
+		error = himax_set_fw_charger_mode(ts, error > 0);
+		if (error) {
+			dev_warn_ratelimited(&ts->client->dev,
+					     "Failed to set charger mode: %d\n",
+					     error);
+			dirty = true;
+		}
+	}
+
 	WRITE_ONCE(ts->fw_config_dirty, dirty);
+}
+
+/*
+ * A charger coming or going is applied from the interrupt thread, where the
+ * part is known to answer the bus; here only the fact is recorded. Battery
+ * events are the frequent ones and carry nothing for the controller.
+ */
+static int himax_psy_notifier(struct notifier_block *nb, unsigned long event,
+			      void *data)
+{
+	struct himax_ts_data *ts = container_of(nb, struct himax_ts_data, psy_nb);
+	struct power_supply *psy = data;
+
+	if (event == PSY_EVENT_PROP_CHANGED &&
+	    psy->desc->type != POWER_SUPPLY_TYPE_BATTERY)
+		WRITE_ONCE(ts->fw_config_dirty, true);
+
+	return NOTIFY_OK;
+}
+
+static void himax_psy_unreg_notifier(void *data)
+{
+	power_supply_unreg_notifier(data);
 }
 
 static void himax_reset(struct himax_ts_data *ts)
@@ -669,6 +744,18 @@ static int himax_probe(struct i2c_client *client)
 					  client->name, ts);
 	if (error)
 		return error;
+
+	if (IS_ENABLED(CONFIG_POWER_SUPPLY)) {
+		ts->psy_nb.notifier_call = himax_psy_notifier;
+		error = power_supply_reg_notifier(&ts->psy_nb);
+		if (error)
+			return error;
+
+		error = devm_add_action_or_reset(dev, himax_psy_unreg_notifier,
+						 &ts->psy_nb);
+		if (error)
+			return error;
+	}
 
 	return 0;
 }

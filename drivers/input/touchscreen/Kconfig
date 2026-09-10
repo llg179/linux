@@ -1402,7 +1402,7 @@ config TOUCHSCREEN_ZINITIX
 
 config TOUCHSCREEN_HIMAX_HX83112B
 	tristate "Himax hx83112b touchscreen driver"
-	depends on I2C
+	depends on I2C && (DRM || !DRM)
 	select REGMAP_I2C
 	help
 	  Say Y here to enable support for Himax hx83112b touchscreens.

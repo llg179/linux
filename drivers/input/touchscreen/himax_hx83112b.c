@@ -12,6 +12,7 @@
  * Copyright (C) 2017 Himax Corporation.
  */
 
+#include <drm/drm_panel.h>
 #include <linux/bits.h>
 #include <linux/delay.h>
 #include <linux/err.h>
@@ -123,6 +124,8 @@ struct himax_ts_data {
 	bool fw_config_dirty;
 	unsigned long reset_jiffies;
 	struct notifier_block psy_nb;
+	struct drm_panel_follower panel_follower;
+	bool is_panel_follower;
 };
 
 /*
@@ -657,6 +660,43 @@ static irqreturn_t himax_irq_handler(int irq, void *dev_id)
 	return IRQ_HANDLED;
 }
 
+/*
+ * These are TDDI parts: the display half and the touch half are one die, and
+ * the panel driver toggles the die's reset line every time it prepares the
+ * panel. Measured on a Fairphone 3 across one screen-off/on cycle: the idle
+ * mode switch this driver had cleared was back to the firmware default
+ * afterwards, with no interrupt raised in between for the driver to notice. So
+ * when the DT ties the touchscreen to its panel, follow it: hold the interrupt
+ * off while the panel is down, and put the configuration back once the panel
+ * driver has finished bringing the die up, which is well past the firmware's
+ * reload window.
+ */
+static int himax_panel_prepared(struct drm_panel_follower *follower)
+{
+	struct himax_ts_data *ts = container_of(follower, struct himax_ts_data,
+						panel_follower);
+
+	himax_apply_fw_config(ts);
+	/* And have the first interrupt read it back once more. */
+	WRITE_ONCE(ts->fw_config_dirty, true);
+	enable_irq(ts->client->irq);
+	return 0;
+}
+
+static int himax_panel_unpreparing(struct drm_panel_follower *follower)
+{
+	struct himax_ts_data *ts = container_of(follower, struct himax_ts_data,
+						panel_follower);
+
+	disable_irq(ts->client->irq);
+	return 0;
+}
+
+static const struct drm_panel_follower_funcs himax_panel_follower_funcs = {
+	.panel_prepared = himax_panel_prepared,
+	.panel_unpreparing = himax_panel_unpreparing,
+};
+
 static int himax_probe(struct i2c_client *client)
 {
 	int error;
@@ -757,12 +797,31 @@ static int himax_probe(struct i2c_client *client)
 			return error;
 	}
 
+	if (drm_is_panel_follower(dev)) {
+		/*
+		 * The panel owns the interrupt from here: it is enabled by
+		 * panel_prepared, which the follower core calls at once if the
+		 * panel is already up.
+		 */
+		disable_irq(client->irq);
+		ts->is_panel_follower = true;
+		ts->panel_follower.funcs = &himax_panel_follower_funcs;
+		error = devm_drm_panel_add_follower(dev, &ts->panel_follower);
+		if (error)
+			return dev_err_probe(dev, error,
+					     "Failed to follow the panel\n");
+	}
+
 	return 0;
 }
 
 static int himax_suspend(struct device *dev)
 {
 	struct himax_ts_data *ts = dev_get_drvdata(dev);
+
+	/* The panel's unprepare already did this. */
+	if (ts->is_panel_follower)
+		return 0;
 
 	disable_irq(ts->client->irq);
 	return 0;
@@ -771,6 +830,9 @@ static int himax_suspend(struct device *dev)
 static int himax_resume(struct device *dev)
 {
 	struct himax_ts_data *ts = dev_get_drvdata(dev);
+
+	if (ts->is_panel_follower)
+		return 0;
 
 	enable_irq(ts->client->irq);
 	return 0;

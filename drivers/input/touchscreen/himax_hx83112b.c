@@ -44,6 +44,15 @@
 
 #define HIMAX_INVALID_COORD		0xffff
 
+/*
+ * Time the controller needs on its supplies before it answers the bus. Measured
+ * on a Fairphone 3 (hx83112b): with the panel powered down, a probe that
+ * enabled the rails and reset the part straight away had its product-id read
+ * NACKed three times out of three, and succeeded first time once the rails had
+ * been up for a while. 20 ms is chosen, not measured as a minimum.
+ */
+#define HIMAX_POWER_ON_DELAY_MS		20
+
 struct himax_event_point {
 	__be16 x;
 	__be16 y;
@@ -467,6 +476,13 @@ static int himax_probe(struct i2c_client *client)
 					       himax_supplies);
 	if (error)
 		return dev_err_probe(dev, error, "Failed to enable supplies\n");
+
+	/*
+	 * When this driver's reference is what brought the rails up, the part
+	 * is still powering on; a reset and a read issued immediately are
+	 * NACKed and probe fails, releasing the rails again.
+	 */
+	msleep(HIMAX_POWER_ON_DELAY_MS);
 
 	ts->gpiod_rst = devm_gpiod_get(dev, "reset", GPIOD_OUT_HIGH);
 	error = PTR_ERR_OR_ZERO(ts->gpiod_rst);
